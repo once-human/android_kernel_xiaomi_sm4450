@@ -37,7 +37,56 @@
 
 #define MASK_SIZE        32
 
+/*
+ * Upper bound for the panic window handed to the firmware. The virtual
+ * watchdog takes the bark and bite times as u16 milliseconds, so a larger
+ * value would be silently truncated by the backend.
+ */
+#define QCOM_WDOG_MAX_OOP_TIMEOUT_S	55
+
 static struct msm_watchdog_data *wdog_data;
+
+static void qcom_wdt_restart_work_fn(struct work_struct *work)
+{
+	struct msm_watchdog_data *wdog_dd =
+		container_of(work, struct msm_watchdog_data, restart_work);
+
+	dev_emerg(wdog_dd->dev, "QCOM Apps Watchdog: restarting the platform\n");
+	emergency_restart();
+}
+
+/**
+ * qcom_wdt_request_restart() - Reset the platform through the normal path.
+ *
+ * @wdog_dd: watchdog data
+ * @reason:  short description used in the log message
+ *
+ * A non-secure watchdog bite is handled by the firmware as an unrecoverable
+ * crash; depending on the platform this can leave the SoC in download (EDL)
+ * mode instead of booting normally. Restarting through the platform reset path
+ * has no such side effect, it performs the same reset a user initiated reboot
+ * does.
+ *
+ * The reset itself is deferred to a work item because the bark interrupt and
+ * the panic notifiers may run in contexts where printing is unsafe and the
+ * other CPUs are already stopped.
+ *
+ * Return: %true if this call queued the restart, %false if a restart was
+ *	   already queued.
+ */
+static bool qcom_wdt_request_restart(struct msm_watchdog_data *wdog_dd,
+				     const char *reason)
+{
+	if (atomic_xchg(&wdog_dd->restart_pending, 1))
+		return false;
+
+	dev_emerg(wdog_dd->dev,
+		  "QCOM Apps Watchdog: %s, restarting instead of biting\n",
+		  reason);
+	schedule_work(&wdog_dd->restart_work);
+
+	return true;
+}
 
 static void qcom_wdt_dump_cpu_alive_mask(struct msm_watchdog_data *wdog_dd)
 {
@@ -256,11 +305,18 @@ EXPORT_SYMBOL(qcom_wdt_pet_resume);
 static void qcom_wdt_reset_on_oops(struct msm_watchdog_data *wdog_dd,
 			int timeout)
 {
+	u32 bark_time;
+
+	if (timeout < 0)
+		timeout = 0;
+	if (timeout > QCOM_WDOG_MAX_OOP_TIMEOUT_S)
+		timeout = QCOM_WDOG_MAX_OOP_TIMEOUT_S;
+
+	bark_time = (timeout + 10) * 1000;
+
 	wdog_dd->ops->reset_wdt(wdog_dd);
-	wdog_dd->ops->set_bark_time((timeout + 10) * 1000,
-					wdog_dd);
-	wdog_dd->ops->set_bite_time((timeout + 10) * 1000,
-					wdog_dd);
+	wdog_dd->ops->set_bark_time(bark_time, wdog_dd);
+	wdog_dd->ops->set_bite_time(bark_time, wdog_dd);
 }
 
 static int qcom_wdt_panic_handler(struct notifier_block *this,
@@ -270,6 +326,28 @@ static int qcom_wdt_panic_handler(struct notifier_block *this,
 				struct msm_watchdog_data, panic_blk);
 
 	wdog_dd->in_panic = true;
+
+	if (QCOM_WDOG_REBOOT_INSTEAD_OF_BITE) {
+		/*
+		 * An early bite would cut the panic log short and the late bite taken
+		 * on the restart path would turn an otherwise clean reboot into a
+		 * firmware visible crash. Neither is needed: with a positive
+		 * panic_timeout the kernel reboots by itself, and otherwise this
+		 * notifier is the last context that can still do it.
+		 */
+		if (panic_timeout > 0) {
+			qcom_wdt_reset_on_oops(wdog_dd, panic_timeout);
+			return NOTIFY_DONE;
+		}
+
+		dev_emerg(wdog_dd->dev,
+			  "QCOM Apps Watchdog: panicked with kernel.panic=%d, rebooting\n",
+			  panic_timeout);
+		emergency_restart();
+
+		return NOTIFY_DONE;
+	}
+
 	if (WDOG_BITE_EARLY_PANIC) {
 		pr_info("Triggering early bite\n");
 		qcom_wdt_trigger_bite();
@@ -339,7 +417,22 @@ static int restart_wdog_handler(struct notifier_block *this,
 {
 	struct msm_watchdog_data *wdog_dd = container_of(this,
 				struct msm_watchdog_data, restart_blk);
-	if (WDOG_BITE_ON_PANIC && wdog_dd->in_panic) {
+
+	if (!wdog_dd->in_panic)
+		return NOTIFY_DONE;
+
+	if (QCOM_WDOG_REBOOT_INSTEAD_OF_BITE) {
+		/*
+		 * The platform restart is already in progress. Biting now would
+		 * replace it with a non-secure bite, which the firmware reports as
+		 * a crash; let the restart run to completion instead.
+		 */
+		dev_info(wdog_dd->dev,
+			 "QCOM Apps Watchdog: not biting on panic, restart in progress\n");
+		return NOTIFY_DONE;
+	}
+
+	if (WDOG_BITE_ON_PANIC) {
 		/*
 		 * Trigger a watchdog bite here and if this fails,
 		 * device will take the usual restart path.
@@ -584,6 +677,8 @@ static __ref int qcom_wdt_kthread(void *arg)
 			delay_time = msecs_to_jiffies(wdog_dd->pet_time);
 			wdog_dd->ops->reset_wdt(wdog_dd);
 			wdog_dd->last_pet = sched_clock();
+			/* A completed pet clears the bark recovery budget */
+			WRITE_ONCE(wdog_dd->bark_recovery_count, 0);
 		}
 		/* Check again before scheduling
 		 * Could have been changed on other cpu
@@ -654,21 +749,37 @@ int qcom_wdt_remove(struct platform_device *pdev)
 		del_timer_sync(&wdog_dd->user_pet_timer);
 	wdog_dd->timer_expired = true;
 	wdog_dd->user_pet_complete = true;
+	cancel_work_sync(&wdog_dd->restart_work);
 	kthread_stop(wdog_dd->watchdog_task);
 	return 0;
 }
 EXPORT_SYMBOL(qcom_wdt_remove);
 
 /**
- * qcom_wdt_trigger_bite - Executes a watchdog bite.
+ * qcom_wdt_trigger_bite - Reset the SoC after a watchdog timeout.
  *
- * Return: function will not return, to allow for the bite to occur
+ * With CONFIG_QCOM_WDOG_REBOOT_INSTEAD_OF_BITE the reset is performed through
+ * the platform reset path and this function returns to its caller. Otherwise a
+ * non-secure bite is requested from the firmware.
+ *
+ * Return: does not return when the non-secure bite is used.
  */
 void qcom_wdt_trigger_bite(void)
 {
 	if (!wdog_data)
 		return;
 	compute_irq_count();
+
+	if (QCOM_WDOG_REBOOT_INSTEAD_OF_BITE) {
+		/*
+		 * A non-secure bite looks like an unrecoverable crash to the
+		 * firmware, and on this platform that is what can leave the device
+		 * in download (EDL) mode on the next boot.
+		 */
+		qcom_wdt_request_restart(wdog_data, "watchdog timeout");
+		return;
+	}
+
 	dev_err(wdog_data->dev, "Causing a QCOM Apps Watchdog bite!\n");
 	wdog_data->ops->show_wdt_status(wdog_data);
 	wdog_data->ops->set_bite_time(1, wdog_data);
@@ -687,6 +798,58 @@ void qcom_wdt_trigger_bite(void)
 
 }
 EXPORT_SYMBOL(qcom_wdt_trigger_bite);
+
+/**
+ * qcom_wdt_bark_recover() - Re-arm the watchdog from the bark handler.
+ *
+ * @wdog_dd: watchdog data
+ *
+ * The bark interrupt is delivered while a CPU is still executing, so a bark
+ * normally means that the pet thread was delayed by a scheduling stall rather
+ * than that the system is wedged. Resetting the SoC at that point kills a
+ * healthy system, and a non-secure bite makes the firmware treat the next boot
+ * as a crash recovery.
+ *
+ * Re-arming the timer here keeps the hypervisor deadline satisfied, so nothing
+ * is hidden: if the pet thread really is stuck the bark fires again and the
+ * platform is restarted once the recovery budget is exhausted.
+ *
+ * Return: %true if the watchdog was re-armed and no restart is needed.
+ */
+static bool qcom_wdt_bark_recover(struct msm_watchdog_data *wdog_dd)
+{
+	unsigned int count;
+
+	if (!wdog_dd->enabled)
+		return false;
+
+	/*
+	 * During a panic the reboot is already being dealt with, keep the
+	 * deadline satisfied so that a late bark cannot cut the dump short.
+	 */
+	if (wdog_dd->in_panic) {
+		wdog_dd->ops->reset_wdt(wdog_dd);
+		wdog_dd->last_pet = sched_clock();
+		return true;
+	}
+
+	if (!QCOM_WDOG_BARK_RECOVERY)
+		return false;
+
+	count = READ_ONCE(wdog_dd->bark_recovery_count) + 1;
+	if (count > wdog_dd->bark_recovery_limit)
+		return false;
+	WRITE_ONCE(wdog_dd->bark_recovery_count, count);
+
+	wdog_dd->ops->reset_wdt(wdog_dd);
+	wdog_dd->last_pet = sched_clock();
+
+	dev_warn(wdog_dd->dev,
+		 "QCOM Apps Watchdog bark %u/%u: re-petting instead of biting\n",
+		 count, wdog_dd->bark_recovery_limit);
+
+	return true;
+}
 
 static irqreturn_t qcom_wdt_bark_handler(int irq, void *dev_id)
 {
@@ -709,6 +872,10 @@ static irqreturn_t qcom_wdt_bark_handler(int irq, void *dev_id)
 		dev_info(wdog_dd->dev, "Suspend in progress\n");
 
 	md_dump_process();
+
+	if (qcom_wdt_bark_recover(wdog_dd))
+		return IRQ_HANDLED;
+
 	qcom_wdt_trigger_bite();
 
 	return IRQ_HANDLED;
@@ -792,6 +959,9 @@ static int qcom_wdt_init(struct msm_watchdog_data *wdog_dd,
 	register_restart_handler(&wdog_dd->restart_blk);
 	mutex_init(&wdog_dd->disable_lock);
 	init_waitqueue_head(&wdog_dd->pet_complete);
+	INIT_WORK(&wdog_dd->restart_work, qcom_wdt_restart_work_fn);
+	atomic_set(&wdog_dd->restart_pending, 0);
+	wdog_dd->bark_recovery_limit = QCOM_WDOG_BARK_RECOVERY;
 	wdog_dd->timer_expired = false;
 	wdog_dd->user_pet_complete = true;
 	wdog_dd->user_pet_enabled = false;

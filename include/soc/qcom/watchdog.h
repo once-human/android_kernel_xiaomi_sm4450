@@ -33,7 +33,9 @@
 #endif
 
 #if IS_ENABLED(CONFIG_QCOM_WDT_CORE)
+#include <linux/atomic.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 
 /**
  *  The enable constant that can be used between the core framework and the
@@ -62,6 +64,27 @@
 #define QCOM_WATCHDOG_USERSPACE_PET 1
 #else
 #define QCOM_WATCHDOG_USERSPACE_PET 0
+#endif
+
+/*
+ * Number of times the bark handler may re-arm the watchdog before the driver
+ * gives up and restarts the platform. Zero keeps the historical behaviour of
+ * biting on the very first bark.
+ */
+#ifdef CONFIG_QCOM_WDOG_BARK_RECOVERY
+#define QCOM_WDOG_BARK_RECOVERY		CONFIG_QCOM_WDOG_BARK_RECOVERY
+#else
+#define QCOM_WDOG_BARK_RECOVERY		0
+#endif
+
+/*
+ * Restart the platform through the normal reset path instead of asking the
+ * firmware for a non-secure watchdog bite.
+ */
+#ifdef CONFIG_QCOM_WDOG_REBOOT_INSTEAD_OF_BITE
+#define QCOM_WDOG_REBOOT_INSTEAD_OF_BITE	1
+#else
+#define QCOM_WDOG_REBOOT_INSTEAD_OF_BITE	0
 #endif
 
 
@@ -109,6 +132,10 @@ struct msm_watchdog_data {
 	bool wakeup_irq_enable;
 	bool irq_ppi;
 	unsigned long long last_pet;
+	unsigned int bark_recovery_count;
+	unsigned int bark_recovery_limit;
+	atomic_t restart_pending;
+	struct work_struct restart_work;
 	cpumask_t alive_mask;
 	struct mutex disable_lock;
 	struct msm_watchdog_data * __percpu *wdog_cpu_dd;

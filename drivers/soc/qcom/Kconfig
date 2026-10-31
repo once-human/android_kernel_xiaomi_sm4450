@@ -586,6 +586,40 @@ config QCOM_WDT_CORE
 	   watchdog module must be loaded along with this for watchdog
 	   functionality.
 
+config QCOM_WDOG_BARK_RECOVERY
+	int "Number of bark recoveries before the watchdog restarts"
+	depends on QCOM_WDT_CORE
+	range 0 10
+	default 3
+	help
+	  Number of times the watchdog driver may re-arm the timer from the
+	  bark interrupt handler before it gives up and restarts the platform.
+
+	  A bark is delivered while a CPU is still executing, which normally
+	  means the pet thread was delayed rather than that the system is
+	  wedged. Restarting the SoC at that point discards a healthy system.
+	  If the pet thread really is stuck the bark simply fires again, so
+	  recovery does not hide a real hang; it just tolerates scheduling
+	  stalls. Set this to 0 for the legacy behaviour of restarting on the
+	  very first bark.
+
+config QCOM_WDOG_REBOOT_INSTEAD_OF_BITE
+	bool "Restart the platform instead of requesting a non-secure watchdog bite"
+	depends on QCOM_WDT_CORE
+	default y
+	help
+	  Say Y here to have the watchdog driver perform a normal platform
+	  restart when it has to reset the SoC, instead of asking the firmware
+	  for a non-secure watchdog bite.
+
+	  A non-secure bite is reported to the firmware as an unrecoverable
+	  crash and, on some Qualcomm platforms, is what leaves the device in
+	  download (EDL/QDLoader) mode instead of booting normally. A restart
+	  through the platform reset path is the same operation a user
+	  initiated reboot performs, so the device comes back up.
+
+	  Say N here for the legacy behaviour of always biting.
+
 config QCOM_CX_IPEAK
 	tristate "Common driver to handle Cx iPeak limitation"
 	help
@@ -636,8 +670,8 @@ config QCOM_WDOG_BITE_EARLY_PANIC
 config QCOM_WATCHDOG_BARK_TIME
 	depends on QCOM_WDT_CORE
 	int "Qualcomm Technologies, Inc. Watchdog bark time in ms"
-	default 11000
-	range 11000 11000
+	default 30000
+	range 1000 65535
 	help
 	  The amount of time, in milliseconds, that should elapse after
 	  a watchdog timer reset before a bark interrupt is sent from the
@@ -646,8 +680,8 @@ config QCOM_WATCHDOG_BARK_TIME
 config QCOM_WATCHDOG_PET_TIME
 	depends on QCOM_WDT_CORE
 	int "Qualcomm Technologies, Inc. Watchdog pet time in ms"
-	default 9360
-	range 9360 9360
+	default 10000
+	range 1000 65535
 	help
 	  The amount of time, in milliseconds, that should elapse before
 	  a watchdog pet is initiated to reset the watchdog timer to 0.
