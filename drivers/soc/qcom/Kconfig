@@ -695,6 +695,13 @@ config QCOM_WATCHDOG_IPI_PING
 	  keep-alive ping to other cpu's if it is set to 1. Otherwise, when
 	  it is set to 0 no keep alive pings will be sent.
 
+comment "Watchdog IPI ping increases cross-CPU latency on every pet."
+	depends on QCOM_WDT_CORE && QCOM_WATCHDOG_IPI_PING
+	help
+	  Enabling this keeps the watchdog driver issuing a synchronous IPI to
+	  every online core on each pet interval. On an otherwise idle system
+	  that still adds roughly 0.7 s of chain latency per pet.
+
 config QCOM_WATCHDOG_WAKEUP_ENABLE
 	depends on QCOM_WDT_CORE
 	bool "Qualcomm Technologies, Inc. Watchdog wakeup enable"
